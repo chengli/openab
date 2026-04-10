@@ -38,9 +38,24 @@ impl EventHandler for Handler {
         let in_allowed_channel =
             self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
 
-        let is_mentioned = msg.mentions_user_id(bot_id)
-            || msg.content.contains(&format!("<@{}>", bot_id))
-            || msg.mention_roles.iter().any(|r| msg.content.contains(&format!("<@&{}>", r)));
+        // Check direct user mention
+        let is_user_mentioned = msg.mentions_user_id(bot_id)
+            || msg.content.contains(&format!("<@{}>", bot_id));
+
+        // Check role mention — only match THIS bot's roles, not all roles
+        // in the message (prevents cross-bot mention triggering in multi-bot guilds).
+        let is_role_mentioned = if let Some(guild_id) = msg.guild_id {
+            match guild_id.member(&ctx.http, bot_id).await {
+                Ok(bot_member) => {
+                    msg.mention_roles.iter().any(|r| bot_member.roles.contains(r))
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
+
+        let is_mentioned = is_user_mentioned || is_role_mentioned;
 
         let in_thread = if !in_allowed_channel {
             match msg.channel_id.to_channel(&ctx.http).await {
