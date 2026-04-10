@@ -18,11 +18,21 @@ pub struct Handler {
     pub allowed_users: HashSet<u64>,
     pub allowed_bots_from: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
+    /// Cached bot role IDs per guild. Populated on ready + guild_create events.
+    /// Read during message handling to avoid per-message HTTP calls.
+    pub bot_role_ids: Arc<tokio::sync::RwLock<HashSet<u64>>>,
 }
 
 #[async_trait]
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
+        let bot_id = ctx.cache.current_user().id;
+
+        // P0 self-loop guard: ALWAYS ignore own messages, even if in allowed_bots_from.
+        if msg.author.id == bot_id {
+            return;
+        }
+
         if msg.author.bot {
             if self.allowed_bots_from.is_empty()
                 || !self.allowed_bots_from.contains(&msg.author.id.get())
@@ -32,8 +42,6 @@ impl EventHandler for Handler {
             tracing::info!(bot_id = %msg.author.id, name = %msg.author.name, "accepted bot message (in allowed_bots_from)");
         }
 
-        let bot_id = ctx.cache.current_user().id;
-
         let channel_id = msg.channel_id.get();
         let in_allowed_channel =
             self.allowed_channels.is_empty() || self.allowed_channels.contains(&channel_id);
@@ -42,15 +50,12 @@ impl EventHandler for Handler {
         let is_user_mentioned = msg.mentions_user_id(bot_id)
             || msg.content.contains(&format!("<@{}>", bot_id));
 
-        // Check role mention — only match THIS bot's roles, not all roles
+        // Check role mention — only match THIS bot's cached roles, not all roles
         // in the message (prevents cross-bot mention triggering in multi-bot guilds).
-        let is_role_mentioned = if let Some(guild_id) = msg.guild_id {
-            match guild_id.member(&ctx.http, bot_id).await {
-                Ok(bot_member) => {
-                    msg.mention_roles.iter().any(|r| bot_member.roles.contains(r))
-                }
-                Err(_) => false,
-            }
+        // Uses the role cache populated in ready(), no per-message API call.
+        let is_role_mentioned = if !msg.mention_roles.is_empty() {
+            let cached_roles = self.bot_role_ids.read().await;
+            msg.mention_roles.iter().any(|r| cached_roles.contains(&r.get()))
         } else {
             false
         };
@@ -200,8 +205,28 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, _ctx: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         info!(user = %ready.user.name, "discord bot connected");
+
+        // Cache bot's role IDs across all guilds (avoids per-message API calls)
+        let bot_id = ctx.cache.current_user().id;
+        let mut roles = HashSet::new();
+        for guild in &ready.guilds {
+            match guild.id.member(&ctx.http, bot_id).await {
+                Ok(member) => {
+                    for role in &member.roles {
+                        roles.insert(role.get());
+                    }
+                    tracing::info!(guild_id = %guild.id, role_count = member.roles.len(), "cached bot roles");
+                }
+                Err(e) => {
+                    tracing::warn!(guild_id = %guild.id, error = %e, "failed to cache bot roles");
+                }
+            }
+        }
+        let count = roles.len();
+        *self.bot_role_ids.write().await = roles;
+        info!(total_roles = count, "bot role cache initialized");
     }
 }
 
