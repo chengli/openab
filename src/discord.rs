@@ -16,6 +16,7 @@ pub struct Handler {
     pub pool: Arc<SessionPool>,
     pub allowed_channels: HashSet<u64>,
     pub allowed_users: HashSet<u64>,
+    pub allowed_bots_from: HashSet<u64>,
     pub reactions_config: ReactionsConfig,
 }
 
@@ -23,7 +24,12 @@ pub struct Handler {
 impl EventHandler for Handler {
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.bot {
-            return;
+            if self.allowed_bots_from.is_empty()
+                || !self.allowed_bots_from.contains(&msg.author.id.get())
+            {
+                return;
+            }
+            tracing::info!(bot_id = %msg.author.id, name = %msg.author.name, "accepted bot message (in allowed_bots_from)");
         }
 
         let bot_id = ctx.cache.current_user().id;

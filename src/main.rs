@@ -30,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
         pool_max = cfg.pool.max_sessions,
         channels = ?cfg.discord.allowed_channels,
         users = ?cfg.discord.allowed_users,
+        bots_from = ?cfg.discord.allowed_bots_from,
         reactions = cfg.reactions.enabled,
         "config loaded"
     );
@@ -39,12 +40,14 @@ async fn main() -> anyhow::Result<()> {
 
     let allowed_channels = parse_id_set(&cfg.discord.allowed_channels, "allowed_channels")?;
     let allowed_users = parse_id_set(&cfg.discord.allowed_users, "allowed_users")?;
-    info!(channels = allowed_channels.len(), users = allowed_users.len(), "parsed allowlists");
+    let allowed_bots_from = parse_id_set(&cfg.discord.allowed_bots_from, "allowed_bots_from")?;
+    info!(channels = allowed_channels.len(), users = allowed_users.len(), bots_from = allowed_bots_from.len(), "parsed allowlists");
 
     let handler = discord::Handler {
         pool: pool.clone(),
         allowed_channels,
         allowed_users,
+        allowed_bots_from,
         reactions_config: cfg.reactions,
     };
 
