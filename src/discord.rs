@@ -5,6 +5,7 @@ use crate::reactions::StatusReactionController;
 use serenity::async_trait;
 use serenity::model::channel::{Message, ReactionType};
 use serenity::model::gateway::Ready;
+use serenity::model::guild::Guild;
 use serenity::model::id::{ChannelId, MessageId};
 use serenity::prelude::*;
 use std::collections::HashSet;
@@ -205,28 +206,28 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        info!(user = %ready.user.name, "discord bot connected");
+    async fn ready(&self, _ctx: Context, ready: Ready) {
+        info!(user = %ready.user.name, guilds = ready.guilds.len(), "discord bot connected");
+        // Role cache is populated by guild_create events (fired after ready),
+        // which have complete guild data even for large guilds.
+    }
 
-        // Cache bot's role IDs across all guilds (avoids per-message API calls)
+    /// Fired per guild after ready. Guild data is complete here (unlike ready.guilds
+    /// which only has UnavailableGuild stubs for large guilds).
+    async fn guild_create(&self, ctx: Context, guild: Guild, _is_new: Option<bool>) {
         let bot_id = ctx.cache.current_user().id;
-        let mut roles = HashSet::new();
-        for guild in &ready.guilds {
-            match guild.id.member(&ctx.http, bot_id).await {
-                Ok(member) => {
-                    for role in &member.roles {
-                        roles.insert(role.get());
-                    }
-                    tracing::info!(guild_id = %guild.id, role_count = member.roles.len(), "cached bot roles");
+        match guild.id.member(&ctx.http, bot_id).await {
+            Ok(member) => {
+                let mut roles = self.bot_role_ids.write().await;
+                for role in &member.roles {
+                    roles.insert(role.get());
                 }
-                Err(e) => {
-                    tracing::warn!(guild_id = %guild.id, error = %e, "failed to cache bot roles");
-                }
+                tracing::info!(guild_id = %guild.id, role_count = member.roles.len(), "cached bot roles from guild_create");
+            }
+            Err(e) => {
+                tracing::warn!(guild_id = %guild.id, error = %e, "failed to cache bot roles in guild_create");
             }
         }
-        let count = roles.len();
-        *self.bot_role_ids.write().await = roles;
-        info!(total_roles = count, "bot role cache initialized");
     }
 }
 
