@@ -57,34 +57,39 @@ impl SessionPool {
             return session_dir;
         }
 
-        // Create via git clone --local (hardlinks, fast, fully isolated .git)
+        // Create isolated session directory.
+        // Strategy: try git clone --local first (if base is a git repo).
+        // Fallback: just mkdir (agent will clone repos as needed).
+        // Either way, each session gets its own cwd for file isolation.
         let sessions_base = format!("{}/sessions", base);
         if let Err(e) = tokio::fs::create_dir_all(&sessions_base).await {
             warn!(%thread_id, error = %e, "mkdir sessions failed, using default");
             return base.clone();
         }
 
-        let output = tokio::process::Command::new("git")
+        // Try git clone first (works when base is a git repo, e.g. local dev)
+        let clone_output = tokio::process::Command::new("git")
             .args(["clone", "--local", base, &session_dir])
             .output()
             .await;
 
-        match output {
-            Ok(o) if o.status.success() => {
-                info!(%thread_id, dir = %session_dir, "created isolated session workspace");
-                state.session_dirs.insert(thread_id.to_string(), PathBuf::from(&session_dir));
-                session_dir
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                warn!(%thread_id, %stderr, "git clone failed, using default");
-                base.clone()
-            }
-            Err(e) => {
-                warn!(%thread_id, error = %e, "git clone exec failed, using default");
-                base.clone()
+        let clone_ok = clone_output.as_ref().map(|o| o.status.success()).unwrap_or(false);
+
+        if clone_ok {
+            info!(%thread_id, dir = %session_dir, "created session workspace via git clone");
+        } else {
+            // Fallback: just create an empty directory (for PV-mounted pods)
+            match tokio::fs::create_dir_all(&session_dir).await {
+                Ok(()) => info!(%thread_id, dir = %session_dir, "created session workspace (empty dir)"),
+                Err(e) => {
+                    warn!(%thread_id, error = %e, "session dir creation failed, using default");
+                    return base.clone();
+                }
             }
         }
+
+        state.session_dirs.insert(thread_id.to_string(), PathBuf::from(&session_dir));
+        session_dir
     }
 
     /// Clean up a session's isolated workspace.
