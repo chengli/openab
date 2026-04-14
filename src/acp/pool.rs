@@ -2,9 +2,10 @@ use crate::acp::connection::AcpConnection;
 use crate::config::AgentConfig;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Combined state protected by a single lock to prevent deadlocks.
 /// Lock ordering: always acquire `state` before any operation on either map.
@@ -14,6 +15,9 @@ struct PoolState {
     /// Suspended sessions: thread_key → ACP sessionId.
     /// Saved on eviction so sessions can be resumed via `session/load`.
     suspended: HashMap<String, String>,
+    /// Per-session workspace directories for cleanup on drop.
+    /// Only populated when max_sessions > 1 (multi-session mode).
+    session_dirs: HashMap<String, PathBuf>,
 }
 
 pub struct SessionPool {
@@ -28,9 +32,70 @@ impl SessionPool {
             state: RwLock::new(PoolState {
                 active: HashMap::new(),
                 suspended: HashMap::new(),
+                session_dirs: HashMap::new(),
             }),
             config,
             max_sessions,
+        }
+    }
+
+    /// Create an isolated workspace for a session via `git clone --local`.
+    /// Only active when max_sessions > 1 (multi-session mode).
+    /// Returns session-specific path, or base working_dir on failure.
+    async fn create_session_workspace(&self, state: &mut PoolState, thread_id: &str) -> String {
+        let base = &self.config.working_dir;
+
+        if self.max_sessions <= 1 {
+            return base.clone();
+        }
+
+        let session_dir = format!("{}/sessions/{}", base, thread_id);
+
+        // Reuse existing session dir (reconnect case)
+        if tokio::fs::metadata(&session_dir).await.is_ok() {
+            info!(%thread_id, dir = %session_dir, "reusing session workspace");
+            return session_dir;
+        }
+
+        // Create via git clone --local (hardlinks, fast, fully isolated .git)
+        let sessions_base = format!("{}/sessions", base);
+        if let Err(e) = tokio::fs::create_dir_all(&sessions_base).await {
+            warn!(%thread_id, error = %e, "mkdir sessions failed, using default");
+            return base.clone();
+        }
+
+        let output = tokio::process::Command::new("git")
+            .args(["clone", "--local", base, &session_dir])
+            .output()
+            .await;
+
+        match output {
+            Ok(o) if o.status.success() => {
+                info!(%thread_id, dir = %session_dir, "created isolated session workspace");
+                state.session_dirs.insert(thread_id.to_string(), PathBuf::from(&session_dir));
+                session_dir
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                warn!(%thread_id, %stderr, "git clone failed, using default");
+                base.clone()
+            }
+            Err(e) => {
+                warn!(%thread_id, error = %e, "git clone exec failed, using default");
+                base.clone()
+            }
+        }
+    }
+
+    /// Clean up a session's isolated workspace.
+    async fn cleanup_session_workspace(state: &mut PoolState, thread_id: &str) {
+        if let Some(dir) = state.session_dirs.remove(thread_id) {
+            if dir.exists() {
+                match tokio::fs::remove_dir_all(&dir).await {
+                    Ok(()) => info!(%thread_id, dir = %dir.display(), "cleaned up session workspace"),
+                    Err(e) => error!(%thread_id, dir = %dir.display(), error = %e, "workspace cleanup failed"),
+                }
+            }
         }
     }
 
@@ -71,10 +136,13 @@ impl SessionPool {
             }
         }
 
+        // Create isolated workspace (multi-session only, no-op if max_sessions=1)
+        let session_cwd = self.create_session_workspace(&mut state, thread_id).await;
+
         let mut conn = AcpConnection::spawn(
             &self.config.command,
             &self.config.args,
-            &self.config.working_dir,
+            &session_cwd,
             &self.config.env,
         )
         .await?;
@@ -86,7 +154,7 @@ impl SessionPool {
         let mut resumed = false;
         if let Some(ref sid) = saved_session_id {
             if conn.supports_load_session {
-                match conn.session_load(sid, &self.config.working_dir).await {
+                match conn.session_load(sid, &session_cwd).await {
                     Ok(()) => {
                         info!(thread_id, session_id = %sid, "session resumed via session/load");
                         resumed = true;
@@ -99,7 +167,7 @@ impl SessionPool {
         }
 
         if !resumed {
-            conn.session_new(&self.config.working_dir).await?;
+            conn.session_new(&session_cwd).await?;
             if saved_session_id.is_some() {
                 conn.session_reset = true;
             }
@@ -132,11 +200,17 @@ impl SessionPool {
         for key in stale {
             info!(thread_id = %key, "cleaning up idle session");
             suspend_entry(&mut state, &key);
+            Self::cleanup_session_workspace(&mut state, &key).await;
         }
     }
 
     pub async fn shutdown(&self) {
         let mut state = self.state.write().await;
+        // Clean up all session workspaces
+        let thread_ids: Vec<String> = state.session_dirs.keys().cloned().collect();
+        for tid in &thread_ids {
+            Self::cleanup_session_workspace(&mut state, tid).await;
+        }
         let count = state.active.len();
         state.active.clear(); // Drop impl kills process groups
         info!(count, "pool shutdown complete");
